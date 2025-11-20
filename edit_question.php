@@ -3,6 +3,10 @@ session_start();
 require_once 'db_connect.php';
 
 $id = $_GET['id'] ?? null;
+if (!$id) { 
+    header("Location: create_quiz.php"); 
+    exit(); 
+}
 
 // Pengecekan Akses Admin Persisten
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['quiz_admin_access'])) { 
@@ -10,12 +14,9 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['quiz_admin_access'])) {
     exit();
 }
 
-if (!$id) { 
-    header("Location: create_quiz.php"); 
-    exit(); 
-}
-
+$user_id = $_SESSION['user_id'];
 $message = "";
+$current_data = null; // Inisialisasi
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $question_id = $_POST['id'];
@@ -23,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $type = $_POST['type'];
     $correct_answer = $_POST['correct_answer'];
 
-    // --- VALIDASI OPSI KOSONG (Penting) ---
+    // VALIDASI OPSI KOSONG (Poin 3)
     $option_a = $_POST['option_a'];
     $option_b = $_POST['option_b'];
     $option_c = $_POST['option_c'] ?? null;
@@ -31,38 +32,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $options = ['A' => $option_a, 'B' => $option_b, 'C' => $option_c, 'D' => $option_d];
     
-    // Cek apakah jawaban benar yang dipilih isinya kosong
     if (isset($options[$correct_answer]) && empty(trim($options[$correct_answer])) && $type !== 'truefalse') {
         $success_message = "❌ Gagal memperbarui! Jawaban benar ('{$correct_answer}') tidak boleh kosong.";
-        
-        // Pola PRG untuk error: Simpan pesan error di sesi dan redirect ke halaman daftar
-        $_SESSION['management_message'] = $success_message;
-        header("Location: create_quiz.php"); 
-        exit();
-    }
-    // --- AKHIR VALIDASI ---
-
-    // Atur opsi berdasarkan tipe soal (untuk disimpan ke DB)
-    if ($type === 'truefalse') {
-        $option_a = 'TRUE';
-        $option_b = 'FALSE';
-        $option_c = null;
-        $option_d = null;
-    } 
-
-    $stmt = $conn->prepare("UPDATE questions SET question_text=?, option_a=?, option_b=?, option_c=?, option_d=?, correct_answer=?, type=? WHERE id=?");
-    $stmt->bind_param("sssssssi", $question_text, $option_a, $option_b, $option_c, $option_d, $correct_answer, $type, $question_id);
-    
-    if ($stmt->execute()) {
-        $success_message = "✅ Pertanyaan ID " . htmlspecialchars($question_id) . " berhasil diperbarui!";
     } else {
-        $success_message = "❌ Gagal memperbarui pertanyaan ID " . htmlspecialchars($question_id) . ": " . $conn->error;
+        // PROSES UPDATE KE DB
+        if ($type === 'truefalse') {
+            $option_a = 'TRUE';
+            $option_b = 'FALSE';
+            $option_c = null;
+            $option_d = null;
+        } 
+
+        // PENTING: Tambahkan user_id ke WHERE clause untuk keamanan
+        $stmt = $conn->prepare("UPDATE questions SET question_text=?, option_a=?, option_b=?, option_c=?, option_d=?, correct_answer=?, type=? WHERE id=? AND user_id=?");
+        $stmt->bind_param("ssssssisi", $question_text, $option_a, $option_b, $option_c, $option_d, $correct_answer, $type, $question_id, $user_id);
+        
+        if ($stmt->execute()) {
+            $success_message = "✅ Pertanyaan ID " . htmlspecialchars($question_id) . " berhasil diperbarui!";
+        } else {
+            $success_message = "❌ Gagal memperbarui pertanyaan ID " . htmlspecialchars($question_id) . ": " . $conn->error;
+        }
+        $stmt->close();
     }
     
-    $stmt->close();
     $conn->close();
     
-    // PENTING: Pola PRG - Redirect ke halaman daftar (create_quiz.php) setelah POST
+    // PENTING: Pola PRG - Selalu redirect ke halaman daftar (create_quiz.php)
     $_SESSION['management_message'] = $success_message;
     header("Location: create_quiz.php"); 
     exit();
@@ -70,21 +65,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // --- LOGIKA GET: Tampilan Form Edit ---
 
-// Ambil pesan dari sesi jika ada (dari PRG redirect)
-if (isset($_SESSION['edit_message'])) {
-    $message = $_SESSION['edit_message'];
-    unset($_SESSION['edit_message']);
-}
-
-// Ambil data pertanyaan untuk form
-$stmt_select = $conn->prepare("SELECT * FROM questions WHERE id = ?");
-$stmt_select->bind_param("i", $id);
+// Ambil data pertanyaan untuk form (Tambahkan user_id ke WHERE clause untuk keamanan)
+$stmt_select = $conn->prepare("SELECT * FROM questions WHERE id = ? AND user_id = ?");
+$stmt_select->bind_param("ii", $id, $user_id);
 $stmt_select->execute();
 $q = $stmt_select->get_result()->fetch_assoc();
 $stmt_select->close();
 $conn->close();
 
 if (!$q) {
+    // Jika ID tidak ditemukan atau bukan milik user ini, kembali ke daftar
     header("Location: create_quiz.php");
     exit();
 }

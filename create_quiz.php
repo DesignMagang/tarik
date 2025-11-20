@@ -8,15 +8,17 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['quiz_admin_access'])) {
 require_once 'db_connect.php';
 
 $message = "";
+// Default values untuk retensi form
 $post_data = ['question_text' => '', 'option_a' => '', 'option_b' => '', 'option_c' => '', 'option_d' => '', 'type' => 'multiple', 'correct_answer' => ''];
+$user_id = $_SESSION['user_id'];
 
-// --- 1. TANGANI PESAN DARI SESI ---
+// --- TANGANI PESAN DARI SESI ---
 if (isset($_SESSION['management_message'])) {
     $message = $_SESSION['management_message'];
     unset($_SESSION['management_message']);
 }
 
-// --- 2. LOGIKA POST (TAMBAH PERTANYAAN BARU) ---
+// --- 1. LOGIKA POST (TAMBAH PERTANYAAN BARU) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $is_success = false;
     
@@ -39,7 +41,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     if (isset($options_check[$correct_answer]) && empty(trim($options_check[$correct_answer])) && $type !== 'truefalse') {
         $message = "❌ Gagal menambahkan pertanyaan! Jawaban benar ('{$correct_answer}') tidak boleh kosong.";
-        // Lanjut ke render (tidak redirect), data akan dipertahankan
+        // Jika gagal, data POST dipertahankan untuk retensi
     } else {
         // PROSES SIMPAN KE DB JIKA VALIDASI BERHASIL
         if ($type === 'truefalse') {
@@ -49,8 +51,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $option_d = null;
         } 
         
-        $stmt = $conn->prepare("INSERT INTO questions (question_text, option_a, option_b, option_c, option_d, correct_answer, type) VALUES (?, ?, ?, ?, ?, ?, ?)");
-        $stmt->bind_param("sssssss", $question_text, $option_a, $option_b, $option_c, $option_d, $correct_answer, $type);
+        // PENTING: TAMBAHKAN user_id ke INSERT query
+        $stmt = $conn->prepare("INSERT INTO questions (question_text, option_a, option_b, option_c, option_d, correct_answer, type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        // Asumsi user_id adalah INT (i)
+        $stmt->bind_param("sssssssi", $question_text, $option_a, $option_b, $option_c, $option_d, $correct_answer, $type, $user_id);
 
         if ($stmt->execute()) {
             $message = "✅ Pertanyaan berhasil ditambahkan!";
@@ -69,13 +73,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// --- 3. LOGIKA UNTUK MENAMPILKAN DAFTAR PERTANYAAN ---
+// --- 2. LOGIKA UNTUK MENAMPILKAN DAFTAR PERTANYAAN ---
 $all_questions = [];
-$result = $conn->query("SELECT id, question_text, option_a, option_b, correct_answer, type FROM questions ORDER BY id DESC");
+// PENTING: FILTER DAFTAR PERTANYAAN BERDASARKAN user_id
+$stmt_select = $conn->prepare("SELECT id, question_text, option_a, option_b, correct_answer, type FROM questions WHERE user_id = ? ORDER BY id DESC");
+$stmt_select->bind_param("i", $user_id);
+$stmt_select->execute();
+$result = $stmt_select->get_result();
+
 if ($result) {
     $all_questions = $result->fetch_all(MYSQLI_ASSOC);
 }
-
+$stmt_select->close();
 $conn->close();
 ?>
 
@@ -202,7 +211,6 @@ $conn->close();
         const type = typeSelect.value;
         let optionsHTML = '';
         
-        // 1. Setup opsi jawaban
         if (type === 'truefalse') {
             optionFields.style.display = 'none';
             inputA.required = false;
