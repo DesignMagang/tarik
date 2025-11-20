@@ -1,4 +1,4 @@
-// index.js (Versi FINAL Stabil - Integrasi Audio dan Ronde)
+// index.js (Versi FINAL - Soal Tanpa Pengulangan Antar Ronde)
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -23,9 +23,9 @@ const io = new Server(server, {
 // --- Constants & Data In-memory ---
 const PULL_UNIT = 5;
 const WIN_THRESHOLD = 90;
-const sessions = {};
+const sessions = {}; // Kunci sesi adalah user_id dari pemilik
 const roles = {};
-const questionSets = {};
+const questionSets = {}; // Master set soal (tidak diacak) disimpan berdasarkan USER_ID
 
 function getOppositeRole(role) {
     return role === 'player1' ? 'player2' : 'player1';
@@ -39,10 +39,11 @@ function shuffleArray(array) {
     return array;
 }
 
-async function loadQuestions(sessionId) {
+async function loadQuestions(userId) {
     try {
-        const [rows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_answer, type FROM questions ORDER BY id ASC");
-        questionSets[sessionId] = rows;
+        // PENTING: Memfilter soal HANYA milik user ini
+        const [rows] = await db.query("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_answer, type FROM questions WHERE user_id = ? ORDER BY id ASC", [userId]);
+        questionSets[userId] = rows;
         return rows;
     } catch (error) {
         console.error("Error loading questions:", error);
@@ -50,7 +51,6 @@ async function loadQuestions(sessionId) {
     }
 }
 
-// --- Game Logic Functions ---
 function calculateNewPosition(currentPosition, winnerRole) {
     if (winnerRole === 'player1') {
         return Math.max(0, currentPosition - PULL_UNIT);
@@ -65,31 +65,27 @@ function gameOver(sessionId, winner, reason) {
     if (session.state === 'finished') return;
 
     session.state = 'finished';
-
-    // Tentukan siapa yang kalah
     const loser = (winner === 'player1') ? 'player2' : 'player1';
 
-    // Kirim pesan ke semua klien
-    io.to(`session_${sessionId}`).emit('game_over', { winner, loser, reason, finalPosition: session.position });
+    io.to(`session_${sessionId}`).emit('game_over', { winner, loser, reason, finalPosition: session.position, pulls: session.pulls });
 
-    // Siapkan untuk ronde berikutnya (jika ada)
     setTimeout(() => {
         io.to(`session_${sessionId}`).emit('game_state_change', { state: 'round_finished', round: session.currentRound, bgm: session.bgmFile });
     }, 3000);
 }
-
-// --- Socket.IO Handlers ---
 
 io.on('connection', (socket) => {
     console.log('✅ New socket connected:', socket.id);
 
     // --- Join Session ---
     socket.on('join_session', async(payload) => {
-        const { sessionId, userId, deviceName, role } = payload;
-        if (!sessionId) return;
+        const { sessionId, userId, deviceName, role, ownerUsername } = payload;
+        if (!sessionId || !userId) return;
+
         socket.join(`session_${sessionId}`);
 
         if (!sessions[sessionId]) {
+            // Inisialisasi Sesi Baru
             sessions[sessionId] = {
                 state: 'waiting',
                 players: {},
@@ -98,73 +94,85 @@ io.on('connection', (socket) => {
                 currentRound: 0,
                 pulls: { player1: 0, player2: 0 },
                 position: 50,
-                answeredQuestions: {},
-                currentQuestionSet: [],
-                bgmFile: 'milikku.mp3'
+                answeredQuestions: {}, // Tracking jawaban dalam 1 soal
+                currentQuestionSet: [], // Soal untuk ronde saat ini
+                bgmFile: 'milikku.mp3',
+                sessionOwner: ownerUsername || null,
+                ownerUserId: userId,
+                // --- PERUBAHAN KRITIS: Pelacakan soal yang sudah digunakan ---
+                allQuestionsUsedIds: new Set()
             };
-            await loadQuestions(sessionId);
+            await loadQuestions(userId); // Muat Master Set Soal
         }
 
         sessions[sessionId].players[socket.id] = { id: socket.id, deviceName, role };
 
-        // Perbarui roles status
         if (!roles[sessionId]) roles[sessionId] = { host: null, player1: null, player2: null };
 
-        // Kirim status awal ke klien yang baru bergabung
         io.to(socket.id).emit('roles_update', roles[sessionId]);
         io.to(socket.id).emit('game_state_change', { state: sessions[sessionId].state, round: sessions[sessionId].currentRound, bgm: sessions[sessionId].bgmFile });
         io.to(socket.id).emit('update_tug', { position: sessions[sessionId].position, pulls: sessions[sessionId].pulls });
     });
 
-    // --- Role Selection (SAMA) ---
+    // --- Role Selection (TETAP SAMA) ---
     socket.on('choose_role', (data) => {
         const { sessionId, role, username } = data;
+        const session = sessions[sessionId];
+
         if (!roles[sessionId]) roles[sessionId] = { host: null, player1: null, player2: null };
 
-        roles[sessionId][role] = username;
+        // PENTING: Cek 1 - Cek Kepemilikan Sesi
+        if (session && session.sessionOwner && username !== session.sessionOwner) {
+            socket.emit('role_taken', {
+                role: role,
+                username: session.sessionOwner,
+                reason: 'Akses Dibatasi'
+            });
+            return;
+        }
+
+        if (!roles[sessionId][role]) {
+            roles[sessionId][role] = username;
+        } else if (roles[sessionId][role] !== username) {
+            socket.emit('role_taken', { role: role, username: roles[sessionId][role] });
+            return;
+        }
+
         io.to(`session_${sessionId}`).emit("roles_update", roles[sessionId]);
     });
 
-    // --- Request Roles Status (SAMA) ---
-    socket.on('request_roles_status', (data) => {
-        const { sessionId } = data;
-        if (roles[sessionId]) {
-            io.to(socket.id).emit("roles_update", roles[sessionId]);
-        }
-    });
-
-    // --- HOST: Memilih Musik (SAMA) ---
-    socket.on('select_bgm', (data) => {
-        const session = sessions[data.sessionId];
-        if (session) {
-            session.bgmFile = data.bgmFile;
-            io.to(socket.id).emit("status_update", { status: `Musik Latar: ${data.bgmFile} terpilih.` });
-        }
-    });
-
-    // --- Host: Memulai game/ronde baru (start_game) (SAMA) ---
+    // --- Host: Memulai game/ronde baru (start_game) ---
     socket.on('start_game', async(data) => {
         const { sessionId } = data;
         const session = sessions[sessionId];
 
-        const masterQuestions = questionSets[sessionId] || await loadQuestions(sessionId);
+        const masterQuestions = questionSets[session.ownerUserId];
 
         if (!session || (session.state !== 'waiting' && session.state !== 'finished' && session.state !== 'round_finished') || !masterQuestions || masterQuestions.length === 0) {
-            io.to(socket.id).emit("status_update", { status: `❌ Game Gagal START: Cek status atau soal DB.` });
+            io.to(socket.id).emit("status_update", { status: `❌ Game Gagal START: Tidak ada soal milik Anda.` });
             return;
         }
 
-        session.currentRound++;
+        // --- Logika Filtering dan Daur Ulang Soal ---
+        let availableQuestions = masterQuestions.filter(q => !session.allQuestionsUsedIds.has(q.id));
 
-        const shuffledQuestions = shuffleArray([...masterQuestions]);
+        if (availableQuestions.length === 0) {
+            // Semua soal sudah digunakan setidaknya sekali. Lakukan daur ulang.
+            console.log(`♻️ Sesi ${sessionId}: Semua soal (${masterQuestions.length}) sudah digunakan. Me-recycle soal...`);
+            session.allQuestionsUsedIds.clear(); // Bersihkan riwayat penggunaan
+            availableQuestions = [...masterQuestions]; // Gunakan semua soal lagi
+        }
+
+        const shuffledQuestions = shuffleArray(availableQuestions);
         session.currentQuestionSet = shuffledQuestions;
+        // --- Akhir Logika Filtering dan Daur Ulang ---
 
-        // 1. Reset status ronde
+        session.currentRound++;
         session.state = 'playing';
         session.answeredQuestions = {};
         session.currentQuestionIndex = 0;
 
-        // PENTING: RESET POSISI DAN TARIKAN DI SETIAP RONDE
+        // Reset posisi dan tarikan
         session.pulls = { player1: 0, player2: 0 };
         session.position = 50;
 
@@ -175,20 +183,18 @@ io.on('connection', (socket) => {
             io.to(`session_${sessionId}`).emit("question", firstQuestion);
             io.to(`session_${sessionId}`).emit("status_update", { status: `Ronde Baru Dimulai! Soal 1 aktif.` });
 
-            // Kirim status dan BGM file
             io.to(`session_${sessionId}`).emit('game_state_change', {
                 state: 'playing',
                 round: session.currentRound,
                 bgm: session.bgmFile
             });
 
-            // Kirim update posisi 50 dan 0 pulls ke semua klien
             io.to(`session_${sessionId}`).emit('update_tug', { position: 50, pulls: session.pulls });
-            console.log(`▶️ Ronde ${session.currentRound} Dimulai, Posisi direset ke 50.`);
+            console.log(`▶️ Ronde ${session.currentRound} Dimulai, ${shuffledQuestions.length} soal di set ini.`);
         }
     });
 
-    // --- Player: Mengirim jawaban ---
+    // --- Player: Mengirim jawaban (submit_answer) ---
     socket.on('submit_answer', async(data) => {
         const { sessionId, questionId, selected, role } = data;
         const session = sessions[sessionId];
@@ -207,30 +213,24 @@ io.on('connection', (socket) => {
         const correctAnswer = currentQ.correct_answer;
         const correct = (selected.toString().toUpperCase() === correctAnswer.toString().toUpperCase());
 
-        // Tandai sebagai dijawab oleh pemain INI
         if (!session.answeredQuestions[questionId]) {
             session.answeredQuestions[questionId] = [];
         }
 
-        // PENTING: Cek apakah pemain INI sudah menjawab soal INI
         if (session.answeredQuestions[questionId].includes(role)) {
             io.to(socket.id).emit("answer_feedback", { accepted: false, reason: "⚠️ Anda sudah menjawab soal ini. Soal akan dilanjutkan." });
-            // Pindahkan soal agar Player tidak terjebak di soal yang sudah dijawab
             io.to(socket.id).emit('request_next_question', {});
             return;
         }
 
-        // Tandai sebagai dijawab oleh pemain ini
         session.answeredQuestions[questionId].push(role);
 
         if (correct) {
-            // Logika Benar: PULL
             session.pulls[role]++;
             session.position = calculateNewPosition(session.position, role);
 
             io.to(socket.id).emit("answer_feedback", { accepted: true, reason: "✅ Benar! Tali ditarik. Tunggu soal berikutnya." });
         } else {
-            // Logika Salah: LAWAN PULL
             const oppositeRole = getOppositeRole(role);
             session.pulls[oppositeRole]++;
             session.position = calculateNewPosition(session.position, oppositeRole);
@@ -238,11 +238,16 @@ io.on('connection', (socket) => {
             io.to(socket.id).emit("answer_feedback", { accepted: false, reason: "❌ Salah! Tali ditarik lawan. Tunggu soal berikutnya." });
         }
 
-        // Kirim update posisi tali ke semua klien (Host dan Player)
         io.to(`session_${sessionId}`).emit('update_tug', { position: session.position, pulls: session.pulls, puller: correct ? role : getOppositeRole(role) });
 
+        // --- PERUBAHAN KRITIS: Tandai Soal Sudah Digunakan ---
+        if (!session.allQuestionsUsedIds.has(questionId)) {
+            session.allQuestionsUsedIds.add(questionId);
+            console.log(`✅ Soal ID ${questionId} ditambahkan ke daftar yang sudah digunakan. Total digunakan: ${session.allQuestionsUsedIds.size}`);
+        }
+        // --- Akhir Perubahan Kritis ---
 
-        // --- CEK KONDISI KEMENANGAN HANYA DARI POSISI TALI ---
+
         const WIN_THRESHOLD_MIN = 100 - WIN_THRESHOLD;
         const WIN_THRESHOLD_MAX = WIN_THRESHOLD;
 
@@ -255,15 +260,11 @@ io.on('connection', (socket) => {
             gameOver(sessionId, 'player2', 'Pemenang ditentukan oleh tali ditarik ke batas maksimal!');
             return;
         }
-        // --- AKHIR CEK KONDISI KEMENANGAN TALI ---
 
-
-        // Lanjut ke soal berikutnya setelah jawaban (benar atau salah)
         io.to(socket.id).emit('request_next_question', {});
     });
 
-    // --- next_question, reset_game, disconnect (SAMA) ---
-
+    // --- next_question ---
     socket.on('next_question', (data) => {
         const { sessionId } = data;
         const session = sessions[sessionId];
@@ -277,11 +278,13 @@ io.on('connection', (socket) => {
             io.to(socket.id).emit("question", nextQuestion);
             io.to(`session_${sessionId}`).emit("status_update", { status: `Soal #${nextIndex + 1} aktif.` });
         } else {
+            // Semua soal dalam set ronde ini sudah habis
             const finalWinner = (session.position <= 50) ? 'player1' : 'player2';
-            gameOver(sessionId, finalWinner, 'Semua Soal Sudah Dijawab!');
+            gameOver(sessionId, finalWinner, 'Semua Soal dalam ronde ini Sudah Dijawab!');
         }
     });
 
+    // --- reset_game ---
     socket.on('reset_game', (data) => {
         const { sessionId } = data;
         if (!sessions[sessionId]) return;
@@ -295,11 +298,16 @@ io.on('connection', (socket) => {
         sessions[sessionId].currentQuestionIndex = -1;
         sessions[sessionId].currentQuestionSet = [];
 
+        // --- PERUBAHAN KRITIS: Reset Riwayat Penggunaan Soal ---
+        sessions[sessionId].allQuestionsUsedIds = new Set();
+        // --- Akhir Perubahan Kritis ---
+
         io.to(`session_${sessionId}`).emit('update_tug', { position: 50, pulls: sessions[sessionId].pulls });
         io.to(`session_${sessionId}`).emit("status_update", { status: `Game direset, menunggu host memulai.` });
         io.to(`session_${sessionId}`).emit('game_state_change', { state: 'waiting', round: 0, bgm: sessions[sessionId].bgmFile });
     });
 
+    // --- disconnect (TETAP SAMA) ---
     socket.on('disconnect', () => {
         for (const sid in sessions) {
             if (sessions[sid] && sessions[sid].players && sessions[sid].players[socket.id]) {
