@@ -8,279 +8,461 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['quiz_admin_access'])) {
 require_once 'db_connect.php';
 
 $message = "";
-// Default values untuk retensi form
-$post_data = ['question_text' => '', 'option_a' => '', 'option_b' => '', 'option_c' => '', 'option_d' => '', 'type' => 'multiple', 'correct_answer' => ''];
 $user_id = $_SESSION['user_id'];
 
-// --- TANGANI PESAN DARI SESI ---
+// Variabel untuk menahan pesan dari SESSION (untuk PRG)
 if (isset($_SESSION['management_message'])) {
     $message = $_SESSION['management_message'];
     unset($_SESSION['management_message']);
 }
 
-// --- 1. LOGIKA POST (TAMBAH PERTANYAAN BARU) ---
+// Data yang dimuat dari POST (gagal) atau DB (tersimpan)
+$current_rounds_data = [];
+$total_rounds_db = 1;
+$total_questions_db = 0;
+
+// --- 1. LOGIKA UTAMA: BATCH SAVE & VALIDASI KRITIS ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $is_success = false;
+    $rounds_data = $_POST['rounds'] ?? [];
+    $total_rounds = (int)($_POST['total_rounds'] ?? 1);
+    $valid_questions_count = 0;
     
-    // Ambil data POST dan simpan untuk retensi jika gagal
-    foreach ($_POST as $key => $value) {
-        $post_data[$key] = htmlspecialchars(trim($value));
-    }
-    
-    $question_text = $post_data['question_text'];
-    $type = $post_data['type'];
-    $correct_answer = $post_data['correct_answer'];
-    
-    $option_a = $post_data['option_a'];
-    $option_b = $post_data['option_b'];
-    $option_c = $post_data['option_c'] ?? null;
-    $option_d = $post_data['option_d'] ?? null;
-
-    // VALIDASI OPSI KOSONG (Poin 3)
-    $options_check = ['A' => $option_a, 'B' => $option_b, 'C' => $option_c, 'D' => $option_d];
-    
-    if (isset($options_check[$correct_answer]) && empty(trim($options_check[$correct_answer])) && $type !== 'truefalse') {
-        $message = "❌ Gagal menambahkan pertanyaan! Jawaban benar ('{$correct_answer}') tidak boleh kosong.";
-        // Jika gagal, data POST dipertahankan untuk retensi
+    if ($total_rounds < 1) {
+        $message = "❌ Jumlah ronde minimal adalah 1.";
+    } elseif (empty($rounds_data)) {
+        $message = "❌ Tidak ada ronde atau soal yang terdeteksi untuk disimpan.";
     } else {
-        // PROSES SIMPAN KE DB JIKA VALIDASI BERHASIL
-        if ($type === 'truefalse') {
-            $option_a = 'TRUE';
-            $option_b = 'FALSE';
-            $option_c = null;
-            $option_d = null;
-        } 
+        $conn->begin_transaction();
         
-        // PENTING: TAMBAHKAN user_id ke INSERT query
-        $stmt = $conn->prepare("INSERT INTO questions (question_text, option_a, option_b, option_c, option_d, correct_answer, type, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-        // Asumsi user_id adalah INT (i)
-        $stmt->bind_param("sssssssi", $question_text, $option_a, $option_b, $option_c, $option_d, $correct_answer, $type, $user_id);
+        try {
+            // Hapus semua soal lama milik user ini sebelum menyimpan yang baru
+            $stmt_delete = $conn->prepare("DELETE FROM questions WHERE user_id = ?");
+            $stmt_delete->bind_param("i", $user_id);
+            $stmt_delete->execute();
+            $stmt_delete->close();
 
-        if ($stmt->execute()) {
-            $message = "✅ Pertanyaan berhasil ditambahkan!";
-            $is_success = true;
-        } else {
-            $message = "❌ Gagal menambahkan pertanyaan: " . $conn->error;
+            // INSERT query
+            $stmt_insert = $conn->prepare("INSERT INTO questions (question_text, option_a, option_b, option_c, option_d, correct_answer, type, user_id, round_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            $stmt_insert->bind_param("sssssssii", $text, $op_a, $op_b, $op_c, $op_d, $correct, $type, $user_id, $round);
+
+            $round_counter = 1;
+
+            foreach ($rounds_data as $round_content) {
+                if (!isset($round_content['questions']) || empty($round_content['questions'])) continue;
+                
+                foreach ($round_content['questions'] as $q) {
+                    $text = htmlspecialchars(trim($q['question_text'] ?? ''));
+                    $type = htmlspecialchars(trim($q['type'] ?? 'multiple'));
+                    $correct = htmlspecialchars(trim($q['correct_answer'] ?? ''));
+                    $round = $round_counter;
+                    
+                    $op_a = htmlspecialchars(trim($q['option_a'] ?? ''));
+                    $op_b = htmlspecialchars(trim($q['option_b'] ?? ''));
+                    $op_c = htmlspecialchars(trim($q['option_c'] ?? ''));
+                    $op_d = htmlspecialchars(trim($q['option_d'] ?? ''));
+                    
+                    if (empty($text) || empty($correct)) continue;
+
+                    // Logika True/False (T/F)
+                    if ($type === 'truefalse') {
+                        if ($correct !== 'TRUE' && $correct !== 'FALSE') continue;
+                        $op_a = 'TRUE'; $op_b = 'FALSE'; $op_c = null; $op_d = null;
+                    } else {
+                        // Validasi Pilihan Ganda
+                        $options_check = ['A' => $op_a, 'B' => $op_b, 'C' => $op_c, 'D' => $op_d];
+                        if (empty($op_a) || empty($op_b)) continue;
+                        if (isset($options_check[$correct]) && empty(trim($options_check[$correct]))) continue;
+                    }
+                    
+                    // Eksekusi
+                    if ($stmt_insert->execute()) {
+                        $valid_questions_count++;
+                    }
+                }
+                $round_counter++;
+            }
+            
+            if ($valid_questions_count > 0) {
+                $conn->commit();
+                $message = "✅ Berhasil menyimpan {$valid_questions_count} pertanyaan untuk " . ($round_counter - 1) . " ronde!";
+                $is_success = true;
+            } else {
+                $conn->rollback();
+                $message = "❌ Gagal menyimpan. Tidak ada soal yang valid yang terdeteksi.";
+            }
+
+            $stmt_insert->close();
+
+        } catch (Exception $e) {
+            $conn->rollback();
+            $message = "❌ Kesalahan transaksi: " . $e->getMessage();
         }
-        $stmt->close();
+        
+        // Tutup koneksi di blok POST
+        if ($conn) {
+            $conn->close();
+        }
     }
     
-    // Pola PRG diterapkan di sini: Jika sukses, REDIRECT agar data POST hilang.
-    if ($is_success) {
-        $_SESSION['management_message'] = $message;
-        header("Location: create_quiz.php");
-        exit();
+    // PENTING: Pola PRG - SELALU REDIRECT SETELAH POST (Sukses atau Gagal)
+    // Ini memastikan histori browser bersih dan menghilangkan ERR_CACHE_MISS.
+    $_SESSION['management_message'] = $message;
+    header("Location: create_quiz.php");
+    exit();
+}
+
+
+// --- 2. LOGIKA UNTUK MUAT ULANG FORM DARI DB (Mode GET) ---
+
+// Muat data dari Database (Mode GET/Initial Load)
+if (!isset($conn) || !$conn->ping()) {
+    require 'db_connect.php'; // Coba sambungkan kembali
+}
+
+if (isset($conn) && $conn->ping()) {
+    $stmt_select = $conn->prepare("SELECT question_text, option_a, option_b, option_c, option_d, correct_answer, type, round_number FROM questions WHERE user_id = ? ORDER BY round_number ASC, id ASC");
+    $stmt_select->bind_param("i", $user_id);
+    $stmt_select->execute();
+    $result = $stmt_select->get_result();
+
+    $temp_rounds = [];
+    $max_rounds = 1;
+    $total_questions_db = 0;
+    
+    if ($result) {
+        while ($q = $result->fetch_assoc()) {
+            $round_num = (int)$q['round_number'];
+            if (!isset($temp_rounds[$round_num])) {
+                $temp_rounds[$round_num] = ['questions' => []];
+            }
+            $temp_rounds[$round_num]['questions'][] = $q;
+            $max_rounds = max($max_rounds, $round_num);
+            $total_questions_db++;
+        }
     }
-}
-
-// --- 2. LOGIKA UNTUK MENAMPILKAN DAFTAR PERTANYAAN ---
-$all_questions = [];
-// PENTING: FILTER DAFTAR PERTANYAAN BERDASARKAN user_id
-$stmt_select = $conn->prepare("SELECT id, question_text, option_a, option_b, correct_answer, type FROM questions WHERE user_id = ? ORDER BY id DESC");
-$stmt_select->bind_param("i", $user_id);
-$stmt_select->execute();
-$result = $stmt_select->get_result();
-
-if ($result) {
-    $all_questions = $result->fetch_all(MYSQLI_ASSOC);
-}
-$stmt_select->close();
-$conn->close();
+    $current_rounds_data = $temp_rounds;
+    $total_rounds_db = $max_rounds;
+    
+    // Tutup koneksi setelah selesai membaca data
+    if (isset($conn) && $conn->ping()) {
+        $conn->close();
+    }
+} 
 ?>
 
 <!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<title>Manajemen Pertanyaan Kuis</title>
+<title>Buat Pertanyaan & Ronde</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<style>
+/* Kustomisasi Estetika Dark Theme */
+.dark-input {
+    background-color: #374151; /* gray-700 */
+    border-color: #4b5563; /* gray-600 */
+    color: #f3f4f6; /* gray-100 */
+}
+.dark-input:focus {
+    border-color: #3b82f6; /* blue-500 */
+    box-shadow: 0 0 0 1px #3b82f6;
+}
+.btn-primary {
+    background-color: #3b82f6;
+    color: white;
+}
+.btn-primary:hover {
+    background-color: #2563eb;
+}
+.btn-success {
+    background-color: #10b981;
+    color: white;
+}
+.btn-success:hover {
+    background-color: #059669;
+}
+</style>
 </head>
-<body class="min-h-screen bg-gradient-to-br from-blue-100 via-blue-200 to-blue-300 flex flex-col items-center py-10 font-[Poppins]">
+<body class="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center py-10 font-[Poppins]">
 
 <div class="w-full max-w-4xl p-4">
-    <h1 class="text-3xl font-extrabold text-blue-700 mb-6 text-center">📝 Manajemen Pertanyaan Kuis</h1>
-
-    <?php if ($message): ?>
-        <div class="bg-white/90 p-4 rounded-xl shadow-md mb-4 text-center text-sm <?= str_contains($message, '✅') ? 'text-green-600' : 'text-red-600'; ?>">
-            <?= $message; ?>
-        </div>
-    <?php endif; ?>
-
-    <div class="bg-white/90 backdrop-blur-lg shadow-xl p-8 rounded-3xl border border-blue-200 mb-10">
-        <h2 class="text-xl font-bold text-gray-700 mb-4">➕ Tambah Pertanyaan Baru</h2>
+    <div class="bg-gray-800 shadow-2xl p-6 rounded-xl border border-gray-700">
         
-        <form method="POST" class="space-y-4">
-            <textarea name="question_text" placeholder="Tulis pertanyaan di sini..." class="w-full p-3 border rounded-xl" required><?= htmlspecialchars($post_data['question_text']); ?></textarea>
-            
-            <select id="typeSelect" name="type" class="w-full p-2 border rounded-lg">
-                <option value="multiple" <?= $post_data['type'] == 'multiple' ? 'selected' : ''; ?>>Pilihan Ganda</option>
-                <option value="truefalse" <?= $post_data['type'] == 'truefalse' ? 'selected' : ''; ?>>True / False</option>
-            </select>
-            
-            <div id="optionFields" class="grid grid-cols-2 gap-3">
-                <input id="optA" name="option_a" value="<?= $post_data['option_a']; ?>" placeholder="Pilihan A (TRUE)" class="border p-2 rounded-lg" required>
-                <input id="optB" name="option_b" value="<?= $post_data['option_b']; ?>" placeholder="Pilihan B (FALSE)" class="border p-2 rounded-lg" required>
-                <input id="optC" name="option_c" value="<?= $post_data['option_c']; ?>" placeholder="Pilihan C (opsional)" class="border p-2 rounded-lg">
-                <input id="optD" name="option_d" value="<?= $post_data['option_d']; ?>" placeholder="Pilihan D (opsional)" class="border p-2 rounded-lg">
+        <h1 class="text-3xl font-extrabold text-white mb-4 text-center">
+            <span class="text-yellow-400">🏆</span> Buat Pertanyaan & Ronde
+        </h1>
+
+        <?php if ($message): ?>
+            <div id="statusMessage" class="p-4 rounded-xl shadow-md mb-4 text-sm text-center <?= str_contains($message, '✅') ? 'bg-green-700 text-white' : 'bg-red-700 text-white'; ?>">
+                <?= $message; ?>
             </div>
+        <?php endif; ?>
 
-            <select id="correctAnswerSelect" name="correct_answer" class="w-full p-2 border rounded-lg" required>
-                </select>
+        <form method="POST" id="quizForm" class="space-y-6">
+            <input type="hidden" id="total_rounds" name="total_rounds" value="<?= $total_rounds_db; ?>">
 
-            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 rounded-xl transition">
-                ➕ Tambah Pertanyaan
-            </button>
+            <div id="roundsContainer" class="space-y-4">
+                </div>
+
+            <div class="mt-8 flex justify-center space-x-4 p-4 border-t border-gray-700 pt-6">
+                <button type="button" onclick="addRound(null)" class="btn-success px-6 py-3 rounded-xl font-bold">
+                    + Ronde
+                </button>
+                
+                <a href="list_question.php?quiz_id=<?= $user_id ?>" class="btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center">
+                    Daftar
+                </a>
+                
+                <button type="submit" class="bg-yellow-500 hover:bg-yellow-600 text-gray-900 px-6 py-3 rounded-xl font-bold">
+                    💾 Simpan
+                </button>
+            </div>
         </form>
     </div>
-
-    <div class="bg-white/90 backdrop-blur-lg shadow-xl p-8 rounded-3xl border border-blue-200">
-        <h2 class="text-xl font-bold text-gray-700 mb-4">📋 Daftar Pertanyaan (Total: <?= count($all_questions); ?>)</h2>
-        
-        <?php if (count($all_questions) > 0): ?>
-            <div class="overflow-x-auto">
-                <table class="min-w-full bg-white rounded-xl overflow-hidden shadow">
-                    <thead class="bg-blue-500 text-white">
-                        <tr>
-                            <th class="py-2 px-3 text-left">ID</th>
-                            <th class="py-2 px-3 text-left">Pertanyaan</th>
-                            <th class="py-2 px-3 text-left">Jawaban Benar</th>
-                            <th class="py-2 px-3 text-left">Tipe</th>
-                            <th class="py-2 px-3 text-center" colspan="2">Aksi</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($all_questions as $q): ?>
-                        <tr class="border-b hover:bg-gray-50">
-                            <td class="py-2 px-3"><?= $q['id']; ?></td>
-                            <td class="py-2 px-3 text-sm"><?= htmlspecialchars(substr($q['question_text'], 0, 50)) . (strlen($q['question_text']) > 50 ? '...' : ''); ?></td>
-                            <td class="py-2 px-3 font-semibold text-green-600"><?= $q['correct_answer']; ?></td>
-                            <td class="py-2 px-3"><?= ucfirst($q['type']); ?></td>
-                            <td class="py-2 px-3 text-center">
-                                <a href="edit_question.php?id=<?= $q['id']; ?>" class="text-blue-500 hover:underline text-sm">Edit</a>
-                            </td>
-                            <td class="py-2 px-3 text-center">
-                                <button type="button" 
-                                   onclick="openDeleteModal(<?= $q['id']; ?>)"
-                                   class="text-red-500 hover:underline text-sm">Hapus</button>
-                            </td>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-        <?php else: ?>
-            <p class="text-gray-500 italic">Belum ada pertanyaan yang ditambahkan.</p>
-        <?php endif; ?>
-    </div>
-
-    <div class="mt-8 text-center">
-        <a href="tarik.php" class="text-blue-600 hover:underline font-semibold">⬅️ Kembali ke Menu Tarik Tambang</a>
-    </div>
-
 </div>
 
-<div id="deleteModal" class="fixed inset-0 bg-gray-600 bg-opacity-75 hidden items-center justify-center z-50 transition-opacity duration-300">
-    <div class="bg-white rounded-xl shadow-2xl p-6 w-96 transform scale-95 transition-transform duration-300">
-        <h3 class="text-xl font-bold text-red-600 mb-3">⚠️ Konfirmasi Penghapusan</h3>
-        <p class="text-gray-700 mb-6">Apakah Anda yakin ingin menghapus pertanyaan dengan ID: <span id="modalQuestionId" class="font-bold"></span>?</p>
-        <div class="flex justify-end space-x-4">
-            <button type="button" onclick="closeDeleteModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg">
-                Batal
-            </button>
-            <a href="#" id="confirmDeleteButton" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition">
-                Ya, Hapus!
-            </a>
-        </div>
-    </div>
-</div>
 <script>
-    // PENTING: JavaScript membaca nilai $post_data untuk retensi
-    const lastCorrectAnswer = "<?= $post_data['correct_answer']; ?>";
-    const lastType = "<?= $post_data['type']; ?>";
+let roundCounter = 0;
+let questionCounterMap = {}; 
+const roundsContainer = document.getElementById('roundsContainer');
+const totalRoundsInput = document.getElementById('total_rounds');
+const initialData = <?= json_encode($current_rounds_data); ?>;
 
-    const typeSelect = document.getElementById('typeSelect');
-    const optionFields = document.getElementById('optionFields');
-    const correctAnswerSelect = document.getElementById('correctAnswerSelect');
 
-    const inputA = document.getElementById('optA');
-    const inputB = document.getElementById('optB');
-    const inputC = document.querySelector('input[name="option_c"]');
-    const inputD = document.querySelector('input[name="option_d"]');
-
-    function updateForm() {
-        const type = typeSelect.value;
-        let optionsHTML = '';
-        
-        if (type === 'truefalse') {
-            optionFields.style.display = 'none';
-            inputA.required = false;
-            inputB.required = false;
-            
-            optionsHTML = `
-                <option value="">-- Pilih Jawaban Benar --</option>
-                <option value="TRUE">BENAR</option>
-                <option value="FALSE">SALAH</option>
-            `;
-        } else {
-            optionFields.style.display = 'grid';
-            inputA.required = true;
-            inputB.required = true;
-            
-            optionsHTML = `
-                <option value="">-- Pilih Jawaban Benar --</option>
-                <option value="A">A</option>
-                <option value="B">B</option>
-                <option value="C">C</option>
-                <option value="D">D</option>
-            `;
-        }
-        
-        correctAnswerSelect.innerHTML = optionsHTML;
-
-        // 2. RETENSI DATA JAWABAN BENAR
-        if (lastCorrectAnswer) {
-            const selectedOption = document.querySelector(`#correctAnswerSelect option[value="${lastCorrectAnswer}"]`);
-            if (selectedOption) {
-                selectedOption.selected = true;
-            }
-        }
-        
-        // 3. Set placeholder
-        if (type === 'truefalse') {
-            inputA.placeholder = "Opsi A (TRUE)";
-            inputB.placeholder = "Opsi B (FALSE)";
-            inputC.placeholder = "Pilihan C (Abaikan)";
-            inputD.placeholder = "Pilihan D (Abaikan)";
-        } else {
-            inputA.placeholder = "Pilihan A";
-            inputB.placeholder = "Pilihan B";
-            inputC.placeholder = "Pilihan C (opsional)";
-            inputD.placeholder = "Pilihan D (opsional)";
-        }
+document.addEventListener('DOMContentLoaded', () => {
+    // 1. Logic for Transient Success Message
+    const statusMessage = document.getElementById('statusMessage');
+    if (statusMessage) {
+        setTimeout(() => {
+            statusMessage.style.display = 'none';
+        }, 2000); // Sembunyikan setelah 2 detik
     }
-
-    typeSelect.addEventListener('change', updateForm);
     
-    // PENTING: Set nilai typeSelect dari POST data saat pertama kali load
-    document.addEventListener('DOMContentLoaded', () => {
-        typeSelect.value = lastType; 
-        updateForm();
-    });
+    // 2. Muat data yang sudah ada (dari DB atau POST gagal)
+    if (Object.keys(initialData).length > 0) {
+        Object.keys(initialData).forEach(roundNum => {
+            const roundData = initialData[roundNum];
+            addRound(roundData.questions, parseInt(roundNum));
+        });
+    } else {
+        addRound(null, 1); // Tambahkan Ronde 1 default
+    }
+});
+
+
+function addRound(questionsData = null, roundNum = null) {
+    const currentRoundNum = roundNum || ++roundCounter;
     
-    // --- Logika Modal ---
-    const deleteModal = document.getElementById('deleteModal');
-    const modalQuestionId = document.getElementById('modalQuestionId');
-    const confirmDeleteButton = document.getElementById('confirmDeleteButton');
-
-    function openDeleteModal(id) {
-        modalQuestionId.innerText = id;
-        confirmDeleteButton.href = 'delete_question.php?id=' + id;
-        deleteModal.style.display = 'flex';
+    if (roundNum === null) {
+        roundCounter = currentRoundNum;
+    } else if (roundNum > roundCounter) {
+        roundCounter = roundNum;
     }
+    
+    questionCounterMap[currentRoundNum] = 0; 
+    
+    const roundElements = document.querySelectorAll('.round-item');
+    totalRoundsInput.value = roundElements.length + 1; 
 
-    function closeDeleteModal() {
-        deleteModal.style.display = 'none';
+    const roundHtml = `
+        <div class="round-item bg-gray-700 p-4 rounded-xl border border-gray-600" data-round-num="${currentRoundNum}">
+            <div class="flex justify-between items-center cursor-pointer" onclick="toggleCollapse(this)">
+                <h2 class="text-xl font-bold flex items-center">
+                    <span class="arrow-icon mr-2">&#x25BC;</span> Ronde ${currentRoundNum}
+                </h2>
+                <div class="space-x-3">
+                    ${currentRoundNum > 1 ? `<button type="button" onclick="event.stopPropagation(); removeRound(${currentRoundNum})" class="text-red-400 hover:text-red-300">🗑️ Ronde</button>` : ''}
+                </div>
+            </div>
+            
+            <div class="questions-list mt-3 space-y-4" style="display: block;">
+                </div>
+        </div>
+    `;
+    roundsContainer.insertAdjacentHTML('beforeend', roundHtml);
+
+    const questionsList = document.querySelector(`.round-item[data-round-num="${currentRoundNum}"] .questions-list`);
+    
+    if (questionsData && questionsData.length > 0) {
+        questionsData.forEach(qData => addQuestionForm(currentRoundNum, qData));
+    } else {
+        addQuestionForm(currentRoundNum); // Tambahkan 1 soal default
     }
+}
+
+function removeRound(roundNum) {
+    if (confirm(`Apakah Anda yakin ingin menghapus Ronde ${roundNum} beserta semua soal di dalamnya?`)) {
+        const element = document.querySelector(`.round-item[data-round-num="${roundNum}"]`);
+        if (element) {
+            element.remove();
+            const remainingRounds = document.querySelectorAll('.round-item').length;
+            totalRoundsInput.value = remainingRounds;
+        }
+    }
+}
+
+function toggleCollapse(headerElement) {
+    const list = headerElement.nextElementSibling;
+    const arrow = headerElement.querySelector('.arrow-icon');
+    if (list.style.display === "none") {
+        list.style.display = "block";
+        arrow.innerHTML = '&#x25BC;';
+    } else {
+        list.style.display = "none";
+        arrow.innerHTML = '&#x25BA;';
+    }
+}
+
+function addQuestionForm(roundNum, data = null) {
+    const questionIndex = questionCounterMap[roundNum] || 0;
+    questionCounterMap[roundNum] = questionIndex + 1;
+    
+    const defaultData = data || {
+        question_text: '', correct_answer: 'A', type: 'multiple',
+        option_a: '', option_b: '', option_c: '', option_d: ''
+    };
+    
+    const questionsList = document.querySelector(`.round-item[data-round-num="${roundNum}"] .questions-list`);
+    const isTrueFalse = defaultData.type === 'truefalse';
+    
+    const formHtml = `
+        <div class="question-item p-4 border border-gray-600 rounded-xl bg-gray-900 shadow-lg" data-round-num="${roundNum}" data-index="${questionIndex}">
+            
+            <div class="flex justify-between mb-2">
+                <select name="rounds[${roundNum}][questions][${questionIndex}][type]" 
+                        class="type-selector dark-input p-1 rounded text-sm mr-auto"
+                        onchange="updateOptionFields(this, ${roundNum}, ${questionIndex}, true)">
+                    <option value="multiple" ${!isTrueFalse ? 'selected' : ''}>Pilihan Ganda</option>
+                    <option value="truefalse" ${isTrueFalse ? 'selected' : ''}>True / False</option>
+                </select>
+                <button type="button" onclick="removeQuestionItem(${roundNum}, ${questionIndex})" class="text-red-400 hover:text-red-300">&times; Hapus</button>
+            </div>
+            
+            <div class="space-y-3">
+                <label class="block font-semibold">Pertanyaan:</label>
+                <textarea name="rounds[${roundNum}][questions][${questionIndex}][question_text]" 
+                          class="w-full p-2 rounded-lg dark-input" 
+                          rows="2" required>${defaultData.question_text || ''}</textarea>
+
+                <input type="hidden" name="rounds[${roundNum}][questions][${questionIndex}][correct_answer]" class="correct-answer-input" value="${defaultData.correct_answer}">
+                
+                <div class="options-container flex flex-col space-y-2" data-round-num="${roundNum}" data-index="${questionIndex}">
+                    ${generateOptionInputs(roundNum, questionIndex, isTrueFalse, defaultData)}
+                </div>
+            </div>
+            
+            <div class="mt-4 text-right">
+                 <button type="button" onclick="addQuestionForm(${roundNum})" class="text-green-400 hover:text-green-300 font-semibold border border-green-600 px-3 py-1 rounded">
+                    + Pertanyaan
+                 </button>
+            </div>
+        </div>
+    `;
+    questionsList.insertAdjacentHTML('beforeend', formHtml);
+}
+
+function removeQuestionItem(roundNum, index) {
+    const element = document.querySelector(`.question-item[data-round-num="${roundNum}"][data-index="${index}"]`);
+    if (element) {
+        element.remove();
+    }
+}
+
+function toggleCollapse(headerElement) {
+    const list = headerElement.nextElementSibling;
+    const arrow = headerElement.querySelector('.arrow-icon');
+    if (list.style.display === "none") {
+        list.style.display = "block";
+        arrow.innerHTML = '&#x25BC;';
+    } else {
+        list.style.display = "none";
+        arrow.innerHTML = '&#x25BA;';
+    }
+}
+
+function updateOptionFields(selectElement, roundNum, questionIndex, isManualChange) {
+    const type = selectElement.value;
+    const isTrueFalse = type === 'truefalse';
+    const optionsContainer = document.querySelector(`.options-container[data-round-num="${roundNum}"][data-index="${questionIndex}"]`);
+    
+    let defaultData = {
+        question_text: '', correct_answer: isTrueFalse ? 'TRUE' : 'A', type: type,
+        option_a: isTrueFalse ? 'TRUE' : '', 
+        option_b: isTrueFalse ? 'FALSE' : '',
+        option_c: '',
+        option_d: ''
+    };
+
+    if (isManualChange) {
+        setCorrectAnswer(roundNum, questionIndex, isTrueFalse ? 'TRUE' : 'A');
+    }
+    
+    optionsContainer.innerHTML = generateOptionInputs(roundNum, questionIndex, isTrueFalse, defaultData);
+}
+
+function generateOptionInputs(roundNum, index, isTrueFalse, data) {
+    if (isTrueFalse) {
+        // True / False
+        const options = [
+            { key: 'TRUE', label: 'BENAR' },
+            { key: 'FALSE', label: 'SALAH' }
+        ];
+        return `
+            <label class="block font-semibold text-gray-300 pt-2">Jawaban Pilihan:</label>
+            <div class="flex space-x-4">
+                ${options.map(opt => `
+                    <div class="flex items-center p-2 border border-gray-600 rounded-lg bg-gray-700">
+                        <input type="radio" 
+                            name="correct_radio_${roundNum}_${index}" 
+                            value="${opt.key}" 
+                            class="form-radio h-4 w-4 text-yellow-400 dark-input mr-2"
+                            onclick="setCorrectAnswer(${roundNum}, ${index}, '${opt.key}')"
+                            ${data.correct_answer === opt.key ? 'checked' : ''} required>
+                        <span class="font-semibold text-gray-200">${opt.label}</span>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    } else {
+        // Pilihan Ganda (A, B, C, D)
+        const options = ['A', 'B', 'C', 'D'];
+        
+        return `
+            <label class="block font-semibold text-gray-300 pt-2">Opsi Jawaban:</label>
+            <div class="space-y-2">
+            ${options.map(optKey => {
+                const isRequired = (optKey === 'A' || optKey === 'B');
+                const name = `rounds[${roundNum}][questions][${index}][option_${optKey.toLowerCase()}]`;
+                const value = data[`option_${optKey.toLowerCase()}`] || '';
+                
+                return `
+                    <div class="flex items-center space-x-2">
+                        <input type="radio" 
+                            name="correct_radio_${roundNum}_${index}" 
+                            value="${optKey}" 
+                            class="form-radio h-4 w-4 text-yellow-400 dark-input"
+                            onclick="setCorrectAnswer(${roundNum}, ${index}, '${optKey}')"
+                            ${data.correct_answer === optKey ? 'checked' : ''} ${isRequired ? 'required' : ''}>
+                        <input name="${name}" 
+                               value="${value}" 
+                               placeholder="Opsi ${optKey}" 
+                               class="border p-2 rounded-lg flex-grow dark-input" ${isRequired ? 'required' : ''}>
+                    </div>
+                `;
+            }).join('')}
+            </div>
+        `;
+    }
+}
+
+// PENTING: Fungsi untuk mengatur Jawaban Benar dari Radio Button ke input hidden
+function setCorrectAnswer(roundNum, index, value) {
+    const hiddenInput = document.querySelector(`.question-item[data-round-num="${roundNum}"][data-index="${index}"] .correct-answer-input`);
+    if (hiddenInput) {
+        hiddenInput.value = value;
+    }
+}
 </script>
 
 </body>
